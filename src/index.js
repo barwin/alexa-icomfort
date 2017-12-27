@@ -1,26 +1,27 @@
 global.auth = {username: "", password: ""}; // YOUR USERNAME AND PASSWORD FOR MYICOMFORT.COM GO HERE
 
-var iComfort = new (require("icomfort"))(auth);
+var iComfort = new (require("icomfort"))(global.auth);
 
 /**
  * Main entry point.
  * Incoming events from Alexa Lighting APIs are processed via this method.
  */
 exports.handler = function(event, context) {
-    switch (event.header.namespace) {
-        case "Alexa.ConnectedHome.Discovery":
-            handleDiscovery(event, context);
+    const directive = event.directive;
+
+    switch (directive.header.name) {
+        case "Discover":
+            handleDiscovery(directive, context);
             break;
-        case "Alexa.ConnectedHome.Control":
-            handleControl(event, context);
+        case "change":
+            handleChangeRequest(directive, context);
             break;
-        case "Alexa.ConnectedHome.Query":
-            handleQuery(event, context);
+        case "ReportState":
+            handleStateRequest(directive, context);
             break;
         default:
-            console.log("Error, unsupported namespace: " + event.header.namespace);
+            console.log("Error, unsupported request: " + directive.header.name);
             context.fail("Something went wrong");
-            break;
     }
 };
 
@@ -32,14 +33,14 @@ exports.handler = function(event, context) {
 function handleDiscovery(accessToken, context) {
     // Crafting the response header
     var headers = {
-        namespace: "Alexa.ConnectedHome.Discovery",
-        name: "DiscoverAppliancesResponse",
-        payloadVersion: "2"
+        namespace: "Alexa.Discovery",
+        name: "Discover.Response",
+        payloadVersion: "3"
     };
 
     // Response body will be an array of discovered devices
-    var appliances = [],
-        getSystemsInfoParams = {UserId:auth.username};
+    var appliances = [];
+    var getSystemsInfoParams = {UserId:auth.username};
 
 
     iComfort.getSystemsInfo(getSystemsInfoParams)
@@ -47,21 +48,56 @@ function handleDiscovery(accessToken, context) {
             var systemAppliances = systemInfo.Systems;
             for (var i = 0; i < systemAppliances.length; i++) {
                 var thermostat = {
-                    applianceId: systemAppliances[i].Gateway_SN,
-                    manufacturerName: "Lennox",
-                    modelName: "iComfort WiFi",
-                    version: systemAppliances[i].Firmware_Ver,
+                    endpointId: systemAppliances[i].Gateway_SN,
                     friendlyName: systemAppliances[i].System_Name, // Name can be changed in iComfort
-                    friendlyDescription: "Lennox iComfort Thermostat",
-                    isReachable: true,
-                    actions:[
-                        "getTemperatureReading",
-                        "getTargetTemperature",
-                        "setTargetTemperature",
-                        "incrementTargetTemperature",
-                        "decrementTargetTemperature"
-                    ],
-                    additionalApplianceDetails: {}
+                    description: "Lennox iComfort Thermostat",
+                    manufacturerName: "Lennox",
+                    displayCategories: ["THERMOSTAT"],
+                    cookie: {},
+                    capabilities: [
+                        {
+                          type: "AlexaInterface",
+                          interface: "Alexa",
+                          version: "3"
+                        },
+                        {
+                          type: "AlexaInterface",
+                          interface: "Alexa.ThermostatController",
+                          version: "3",
+                          properties: {
+                            supported: [
+                              {
+                                name: "lowerSetpoint"
+                              },
+                              {
+                                name: "targetSetpoint"
+                              },
+                              {
+                                name: "upperSetpoint"
+                              },
+                              {
+                                name: "thermostatMode"
+                              }
+                            ],
+                            proactivelyReported: false,
+                            retrievable: true
+                          }
+                        },
+                        {
+                          type: "AlexaInterface",
+                          interface: "Alexa.TemperatureSensor",
+                          version: "3",
+                          properties: {
+                            supported: [
+                              {
+                                name: "temperature"
+                              }
+                            ],
+                            proactivelyReported: false,
+                            retrievable: true
+                          }
+                        }
+                    ]
                 };
                 appliances.push(thermostat);
             }
@@ -69,8 +105,10 @@ function handleDiscovery(accessToken, context) {
                 discoveredAppliances: appliances
             };
             var result = {
-                header: headers,
-                payload: payloads
+                event: {
+                    header: headers,
+                    payload: payloads
+                }
             };
 
             context.succeed(result);
@@ -83,10 +121,10 @@ function handleDiscovery(accessToken, context) {
  * Control events are processed here.
  * This is called when Alexa requests an action (e.g., "turn off appliance").
  */
-function handleControl(event, context) {
+function handleChangeRequest(directive, context) {
     // Retrieve the appliance id from the incoming Alexa request.
-    var applianceId = event.payload.appliance.applianceId;
-    var message_id = event.header.messageId;
+    var applianceId = directive.endpoint.endpointId;
+    var message_id = directive.header.messageId;
     var confirmation;
 
     var getThermostatInfoListParams = {
@@ -105,9 +143,9 @@ function handleControl(event, context) {
         var currentParams = {
                 systemStatus: responses[0].tStatInfo[0].System_Status,
                 allowedRange: responses[1].Heat_Cool_Dead_Band,
-                currentTemp: fToC(responses[0].tStatInfo[0].Indoor_Temp),
-                currentHeatTo: fToC(responses[0].tStatInfo[0].Heat_Set_Point),
-                currentCoolTo: fToC(responses[0].tStatInfo[0].Cool_Set_Point),
+                currentTemp: responses[0].tStatInfo[0].Indoor_Temp,
+                currentHeatTo: responses[0].tStatInfo[0].Heat_Set_Point,
+                currentCoolTo: responses[0].tStatInfo[0].Cool_Set_Point,
                 toSet: responses[0].tStatInfo[0]
             },
             newParams = {};
@@ -178,11 +216,10 @@ function handleControl(event, context) {
  * Control events are processed here.
  * This is called when Alexa requests an action (e.g., "turn off appliance").
  */
-function handleQuery(event, context) {
+function handleStateRequest(directive, context) {
     // Retrieve the appliance id and accessToken from the incoming Alexa request.
-    var applianceId = event.payload.appliance.applianceId;
-    var message_id = event.header.messageId;
-    var confirmation;
+    var applianceId = directive.endpoint.endpointId;
+    var message_id = directive.header.messageId;
 
     var getThermostatInfoListParams = {
         GatewaySN: applianceId,
@@ -197,82 +234,55 @@ function handleQuery(event, context) {
     .then( function(responses) {
         // Response data to overwrite with new values and put to Lennox
         // Lennox temperature returned in Farenheit, convert to Celsius for Alexa
-        var currentParams = {
-                timestamp: new Date(parseInt(responses[0].tStatInfo[0].DateTime_Mark.replace("/Date(","").replace(")/",""), 10)),
-                programMode: responses[0].tStatInfo[0].Program_Schedule_Selection,
-                currentTemp: fToC(responses[0].tStatInfo[0].Indoor_Temp),
-                currentHeatTo: fToC(responses[0].tStatInfo[0].Heat_Set_Point),
-                currentCoolTo: fToC(responses[0].tStatInfo[0].Cool_Set_Point)
-        };
+        var response = responses[0].tStatInfo[0];
+        var units = "FAHRENHEIT"; // default unit of all returned temp data regardless of preferences
+        var temp = response.Indoor_Temp;
 
-        // check to see what type of request was made before changing temperature
-        switch (event.header.name) {
-            case "GetTemperatureReadingRequest":
-                confirmation = "GetTemperatureReadingResponse";
-                alexaCurrentTempInfo(currentParams.currentTemp, currentParams.timestamp, confirmation);
-                break;
-            case "GetTargetTemperatureRequest":
-                confirmation = "GetTargetTemperatureResponse";
-                alexaTargetRangeInfo(currentParams.currentTemp, currentParams.currentHeatTo, currentParams.currentCoolTo, currentParams.programMode, currentParams.timestamp, confirmation);
-                break;
+        if (response.Pref_Temp_Units === "1") {
+            units = "CELSIUS";
+            temp = fToC(response.Indoor_Temp);
         }
 
+        var currentParams = {
+            timestamp: new Date(parseInt(response.DateTime_Mark.replace("/Date(","").replace(")/",""), 10)),
+            currentTemp: temp,
+            deviceUnits: units
+        };
+
+        alexaCurrentTempInfo(applianceId, currentParams.currentTemp, currentParams.deviceUnits, currentParams.timestamp);
     })
     .catch(console.error);
 
-    var alexaCurrentTempInfo = function(currentTemp, timeStamp, confirmation) {
+    var alexaCurrentTempInfo = function(applianceId, currentTemp, deviceUnits, timeStamp) {
         var result = {
-            header: {
-                namespace: "Alexa.ConnectedHome.Query",
-                name: confirmation,
-                payloadVersion: "2",
-                messageId: message_id // reuses initial message ID, probably not desirable?
+            context: {
+                properties: [{
+                    namespace: "Alexa.TemperatureSensor",
+                    name: "temperature",
+                    value: {
+                        value: currentTemp,
+                        scale: deviceUnits
+                    },
+                    timeOfSample: timeStamp,
+                    uncertaintyInMilliseconds: 1000
+                }]
             },
-            payload: {
-                temperatureReading: {
-                    value: currentTemp
+            event: {
+                header: {
+                    namespace: "Alexa",
+                    name: "StateReport",
+                    payloadVersion: "3",
+                    messageId: message_id // reuses initial message ID, probably not desirable?
                 },
-                applianceResponseTimestamp: timeStamp.toISOString()
+                endpoint: {
+                    endpointId: applianceId
+                },
+                payload: {}
             }
         };
+
         context.succeed(result);
     };
-
-    var alexaTargetRangeInfo = function(currentTemp, heatTo, coolTo, program, timeStamp, confirmation) {
-        var programToTempMode = {
-            0: {tempMode: "CUSTOM", friendlyName: "Summer Program"},
-            1: {tempMode: "CUSTOM", friendlyName: "Winter Program"},
-            2: {tempMode: "CUSTOM", friendlyName: "Spring Fall Program"},
-            3: {tempMode: "ECO", friendlyName: "Save Energy Program"},
-            4: {tempMode: "CUSTOM", friendlyName: "Custom Program"}
-        };
-        var result = {
-            header: {
-                namespace: "Alexa.ConnectedHome.Query",
-                name: confirmation,
-                payloadVersion: "2",
-                messageId: message_id // reuses initial message ID, probably not desirable?
-            },
-            payload: {
-                temperatureReading: {
-                    value: currentTemp
-                },
-                coolingTargetTemperature: {
-                    value: coolTo
-                },
-                heatingTargetTemperature: {
-                    value: heatTo
-                },
-                applianceResponseTimestamp: timeStamp.toISOString(),
-                temperatureMode: {
-                    value: programToTempMode[program].tempMode,
-                    friendlyName: programToTempMode[program].friendlyName
-                }
-            }
-        };
-        context.succeed(result);
-    };
-
 }
 
 function determineNewParameters(currentParams) {
@@ -315,12 +325,12 @@ function determineNewParameters(currentParams) {
     return newParams;
 }
 
-// function to convert Celcius (Alexa default) to Farenheit
+// function to convert Celcius (Alexa default) to Fahrenheit
 function cToF(celsius) {
-  return celsius * 9 / 5 + 32;
+    return Math.round((celsius * 9 / 5 + 32) * 2 ) / 2;
 }
 
-// function to convert Farenheit to Celcius (Alexa default)
+// function to convert Fahrenheit to Celcius (Alexa default)
 function fToC(fahrenheit) {
-  return (fahrenheit - 32) * 5 / 9;
+  return Math.round(((fahrenheit - 32) * 5 / 9) * 2) / 2;
 }
