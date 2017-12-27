@@ -13,7 +13,7 @@ exports.handler = function(event, context) {
         case "Discover":
             handleDiscovery(directive, context);
             break;
-        case "change":
+        case "SetTargetTemperature":
             handleChangeRequest(directive, context);
             break;
         case "ReportState":
@@ -40,7 +40,7 @@ function handleDiscovery(accessToken, context) {
 
     // Response body will be an array of discovered devices
     var appliances = [];
-    var getSystemsInfoParams = {UserId:auth.username};
+    var getSystemsInfoParams = {UserId:global.auth.username};
 
 
     iComfort.getSystemsInfo(getSystemsInfoParams)
@@ -66,18 +66,10 @@ function handleDiscovery(accessToken, context) {
                           version: "3",
                           properties: {
                             supported: [
-                              {
-                                name: "lowerSetpoint"
-                              },
-                              {
-                                name: "targetSetpoint"
-                              },
-                              {
-                                name: "upperSetpoint"
-                              },
-                              {
-                                name: "thermostatMode"
-                              }
+                              { name: "lowerSetpoint" },
+                              { name: "targetSetpoint" },
+                              { name: "upperSetpoint" },
+                              { name: "thermostatMode" }
                             ],
                             proactivelyReported: false,
                             retrievable: true
@@ -88,11 +80,7 @@ function handleDiscovery(accessToken, context) {
                           interface: "Alexa.TemperatureSensor",
                           version: "3",
                           properties: {
-                            supported: [
-                              {
-                                name: "temperature"
-                              }
-                            ],
+                            supported: [ { name: "temperature" } ],
                             proactivelyReported: false,
                             retrievable: true
                           }
@@ -116,16 +104,11 @@ function handleDiscovery(accessToken, context) {
         .catch(console.error);
 }
 
-
-/**
- * Control events are processed here.
- * This is called when Alexa requests an action (e.g., "turn off appliance").
- */
 function handleChangeRequest(directive, context) {
     // Retrieve the appliance id from the incoming Alexa request.
     var applianceId = directive.endpoint.endpointId;
-    var message_id = directive.header.messageId;
-    var confirmation;
+    var messageId = directive.header.messageId;
+    var token = directive.header.correlationToken;
 
     var getThermostatInfoListParams = {
         GatewaySN: applianceId,
@@ -139,87 +122,111 @@ function handleChangeRequest(directive, context) {
     ])
     .then( function(responses) {
         // Response data to overwrite with new values and put to Lennox
-        // Lennox temperature returned in Farenheit, convert to Celsius for Alexa
-        var currentParams = {
-                systemStatus: responses[0].tStatInfo[0].System_Status,
-                allowedRange: responses[1].Heat_Cool_Dead_Band,
-                currentTemp: responses[0].tStatInfo[0].Indoor_Temp,
-                currentHeatTo: responses[0].tStatInfo[0].Heat_Set_Point,
-                currentCoolTo: responses[0].tStatInfo[0].Cool_Set_Point,
-                toSet: responses[0].tStatInfo[0]
-            },
-            newParams = {};
+        // Lennox temperature always returned in Fahrenheit, convert to Celsius if preferred in Lennox
 
-        // check to see what type of request was made before changing temperature
-        switch (event.header.name) {
-            case "SetTargetTemperatureRequest":
-                currentParams.requestedTemp = event.payload.targetTemperature.value;
-                newParams = determineNewParameters(currentParams);
-                confirmation = "SetTargetTemperatureConfirmation";
-                break;
-            case "IncrementTargetTemperatureRequest":
-                var increment = event.payload.deltaTemperature.value;
+        var response = responses[0].tStatInfo[0];
+        var range = responses[1].Heat_Cool_Dead_Band;
+        var units = "FAHRENHEIT";
 
-                currentParams.requestedTemp = fToC(currentParams.toSet.Indoor_Temp) + increment;
-                newParams = determineNewParameters(currentParams);
-                confirmation = "IncrementTargetTemperatureConfirmation";
-                break;
-            case "DecrementTargetTemperatureRequest":
-                var decrement = event.payload.deltaTemperature.value;
-
-                currentParams.requestedTemp = fToC(currentParams.toSet.Indoor_Temp) - decrement;
-                newParams = determineNewParameters(currentParams);
-                confirmation = "DecrementTargetTemperatureConfirmation";
-                break;
+        if (response.Pref_Temp_Units === "1") {
+            units = "CELSIUS";
         }
+
+        var currentParams = {
+            systemStatus: response.System_Status,
+            timeStamp: new Date(parseInt(response.DateTime_Mark.replace("/Date(","").replace(")/",""), 10)),
+            allowedRange: range,
+            currentTemp: {
+                value: response.Indoor_Temp,
+                heatToValue: response.Heat_Set_Point,
+                coolToValue: response.Cool_Set_Point,
+                scale: units
+            },
+            requestedTemp: convertRequestUnits(directive.payload),
+            toSet: response
+        };
+        var newParams = {};
+
+        newParams = determineNewParameters(currentParams);
 
         // send the change request to Lennox, send a response to Alexa on promise fulfillment
         iComfort.setThermostatInfo(newParams.toSet)
         .then( function(newSettings) {
-            alexaChangeConfirmation(newParams.alexaTargetTemp, confirmation, newParams.temperatureMode, currentParams.currentTemp);
+            alexaChangeConfirmation(applianceId, messageId, token, newParams, currentParams.timeStamp);
         })
         .catch(console.error);
 
     })
     .catch(console.error);
 
-    var alexaChangeConfirmation = function(targetTemp, confirmation, tempMode, originalTemp) {
+    var alexaChangeConfirmation = function(applianceId, messageId, token, newParams, timeStamp) {
+        if (newParams.originalScale != "FAHRENHEIT") {
+            newParams.toSet.Indoor_Temp = fToC(newParams.toSet.Indoor_Temp);
+        }
         var result = {
-            header: {
-                namespace: "Alexa.ConnectedHome.Control",
-                name: confirmation,
-                payloadVersion: "2",
-                messageId: message_id // reuses initial message ID, probably not desirable?
-            },
-            payload: {
-                targetTemperature: {
-                    value: targetTemp
-                }
-            },
-            temperatureMode: {
-                value: tempMode
-            },
-            previousState: {
-                targetTemperature: {
-                    value: originalTemp
+            context: {
+                properties: [ {
+                    namespace: "Alexa.ThermostatController",
+                    name: "targetSetpoint",
+                    value: {
+                        value: newParams.toSet.Indoor_Temp,
+                        scale: newParams.originalScale
+                    },
+                    timeOfSample: timeStamp,
+                    uncertaintyInMilliseconds: 1000
                 },
-                mode: {
-                    value: tempMode
+                {
+                    namespace: "Alexa.ThermostatController",
+                    name: "lowerSetpoint",
+                    value: {
+                        value: newParams.toSet.Heat_Set_Point,
+                        scale: newParams.originalScale
+                    },
+                    timeOfSample: timeStamp,
+                    uncertaintyInMilliseconds: 1000
+                },
+                {
+                    namespace: "Alexa.ThermostatController",
+                    name: "upperSetpoint",
+                    value: {
+                        value: newParams.toSet.Cool_Set_Point,
+                        scale: newParams.originalScale
+                    },
+                    timeOfSample: timeStamp,
+                    uncertaintyInMilliseconds: 1000
+                },
+                {
+                    namespace: "Alexa.ThermostatController",
+                    name: "thermostatMode",
+                    value: newParams.temperatureMode,
+                    timeOfSample: timeStamp,
+                    uncertaintyInMilliseconds: 1000
+                } ]
+            },
+            event: {
+                header: {
+                    namespace: "Alexa",
+                    name: "Response",
+                    payloadVersion: "3",
+                    messageId: messageId,
+                    correlationToken: token
                 }
-            }
+            },
+            endpoint: {
+                endpointId: applianceId
+            },
+            payload: {}
         };
         context.succeed(result);
     };
+
 }
 
-/**
- * Control events are processed here.
- * This is called when Alexa requests an action (e.g., "turn off appliance").
- */
 function handleStateRequest(directive, context) {
     // Retrieve the appliance id and accessToken from the incoming Alexa request.
     var applianceId = directive.endpoint.endpointId;
-    var message_id = directive.header.messageId;
+    var messageId = directive.header.messageId;
+    var token = directive.header.correlationToken;
 
     var getThermostatInfoListParams = {
         GatewaySN: applianceId,
@@ -272,7 +279,8 @@ function handleStateRequest(directive, context) {
                     namespace: "Alexa",
                     name: "StateReport",
                     payloadVersion: "3",
-                    messageId: message_id // reuses initial message ID, probably not desirable?
+                    messageId: messageId,
+                    correlationToken: token
                 },
                 endpoint: {
                     endpointId: applianceId
@@ -286,43 +294,66 @@ function handleStateRequest(directive, context) {
 }
 
 function determineNewParameters(currentParams) {
-    var newParams = {
-            temperatureMode: "AUTO",
-            alexaTargetTemp: currentParams.requestedTemp, // in Celsius
-            toSet: currentParams.toSet
-        },
-        dropTemp = (currentParams.currentTemp - currentParams.requestedTemp) > 0; // if this evaluates to false, we stay at the same temp OR increase temp
-
-    newParams.toSet.Indoor_Temp = Math.round(cToF(currentParams.requestedTemp));
-
     // System_Status magic numbers: 0 == idle, 1 == heating, 2 == cooling, 3 == waiting
 
-    // temp is at bottom of current range, i.e. it's colder outside than inside, OR system is heating
-    if ((currentParams.currentTemp - currentParams.currentHeatTo) < (currentParams.currentCoolTo - currentParams.currentTemp) || currentParams.systemStatus === 1) {
-        // raise or lower the bottom accordingly
-        newParams.toSet.Heat_Set_Point = Math.round(cToF(currentParams.requestedTemp));
-        // check to see if existing top is at least the allowed range above the new bottom, if not, raise it at least that much
-        if (!dropTemp && (newParams.toSet.Heat_Set_Point + currentParams.allowedRange) > newParams.toSet.Cool_Set_Point) {
-            newParams.toSet.Cool_Set_Point = newParams.toSet.Heat_Set_Point + currentParams.allowedRange;
-        }
-    }
-    // temp is at top of current range, i.e. it's hotter outside than inside, OR system is cooling
-    else if ((currentParams.currentTemp - currentParams.currentHeatTo) > (currentParams.currentCoolTo - currentParams.currentTemp) || currentParams.systemStatus === 2) {
-        // raise or lower the top accordingly
-        newParams.toSet.Cool_Set_Point = Math.round(cToF(currentParams.requestedTemp));
-        // check to see if existing bottom is at least the allowed range above the new top, if not, raise it at least that much
-        if (dropTemp && (newParams.toSet.Cool_Set_Point - currentParams.allowedRange) < newParams.toSet.Heat_Set_Point) {
-            newParams.toSet.Heat_Set_Point = newParams.toSet.Cool_Set_Point - currentParams.allowedRange;
-        }
-    }
+    var newParams = {
+        toSet: currentParams.toSet,
+        originalScale: currentParams.requestedTemp.originalScale
+    };
+    var request = currentParams.requestedTemp.payload;
+    var colderOutside = (currentParams.currentTemp.value - currentParams.currentTemp.heatToValue) < (currentParams.currentTemp.coolToValue - currentParams.currentTemp.value) || currentParams.systemStatus === 1;
 
-    if (currentParams.requestedTemp > currentParams.currentTemp) {
-        newParams.temperatureMode = "HEAT";
-    } else if (currentParams.requestedTemp < currentParams.currentTemp) {
-        newParams.temperatureMode = "COOL";
+    // Lennox ignores setting the temp directly and requires setting the upper and lower ranges, use those units if provided
+    if ("lowerSetpoint" in request && "upperSetpoint" in request) {
+        newParams.toSet.Indoor_Temp = request.targetSetpoint.value || (colderOutside ? request.lowerSetpoint.value : request.upperSetpoint.value);
+        // setting the upper and lower too close together will fail, check to make sure it's equal to or greater than the allowed range
+        if (currentParams.allowedRange <= (request.upperSetpoint.value - request.lowerSetpoint.value)) {
+            newParams.toSet.Heat_Set_Point = request.lowerSetpoint.value;
+            newParams.toSet.Cool_Set_Point = request.upperSetpoint.value;
+            newParams.temperatureMode = colderOutside ? "HEAT" : "COOL";
+        } else {
+            if (currentParams.currentTemp.value <= request.lowerSetpoint.value || colderOutside) {
+                newParams.toSet.Heat_Set_Point = request.lowerSetpoint.value;
+                newParams.toSet.Cool_Set_Point = request.lowerSetpoint.value + currentParams.allowedRange;
+                newParams.temperatureMode = "HEAT";
+            } else {
+                newParams.toSet.Heat_Set_Point = request.upperSetpoint.value - currentParams.allowedRange;
+                newParams.toSet.Cool_Set_Point = request.upperSetpoint.value;
+                newParams.temperatureMode = "COOL";
+            }
+        }
+    } else if ("targetSetpoint" in request) {
+        newParams.toSet.Indoor_Temp = request.targetSetpoint.value;
+
+        if (colderOutside) {
+            newParams.toSet.Heat_Set_Point = request.targetSetpoint.value;
+            newParams.toSet.Cool_Set_Point = request.targetSetpoint.value + currentParams.allowedRange;
+            newParams.temperatureMode = "HEAT";
+        } else {
+            newParams.toSet.Heat_Set_Point = request.targetSetpoint.value - currentParams.allowedRange;
+            newParams.toSet.Cool_Set_Point = request.targetSetpoint.value;
+            newParams.temperatureMode = "COOL";
+        }
     }
 
     return newParams;
+
+}
+
+// function to check and convert incoming requests to Fahrenheit (Lennox only deals with Fahrenheit for temp changes, even if it displays Celcius)
+function convertRequestUnits(payload) {
+    var payloadForLennox = {
+        payload: payload,
+        originalScale: "FAHRENHEIT"
+    }
+
+    for (var key in payload) {
+        if (payload[key].scale !== "FAHRENHEIT") {
+            payloadForLennox.payload[key].value = cToF(payload[key].value);
+            payloadForLennox.originalScale = payload[key].scale;
+        }
+    }
+    return payloadForLennox;
 }
 
 // function to convert Celcius (Alexa default) to Fahrenheit
